@@ -1,81 +1,71 @@
-﻿using System;
-using System.IO;
-using System.Linq;
-using System.Text.Json;
+﻿using Edr_client_test;
+using System;
+using System.Threading;
 using System.Threading.Tasks;
 
-namespace Edr_client_test
+namespace FileActivityMonitor
 {
     class Program
     {
-        // Keywords for process names
-        static readonly string[] processKeywords = { "notepad", "zoom", "excel", "mspaint", "outlook" };
-        // Keywords for filenames
-        static readonly string[] fileKeywords = { "invoice", "claim", "resume", "budget" };
-        // Folders to watch
-        static readonly string[] foldersToWatch = {
-            @"C:\Payments\Invoices",
-            @"C:\Returns\Claims",
-            @"C:\HR\Resumes",
-            @"C:\Finance\Reports"
-        };
+        private static FileMonitor fileMonitor;
+        private static ProcessMonitor processMonitor;
+        private static CancellationTokenSource cancellationTokenSource;
 
-        static async Task Main()
+        static async Task Main(string[] args)
         {
-            var sender = new JsonSender("http://localhost:5044");
+            Console.WriteLine("File & Program Activity Monitoring Agent Starting...");
 
-            // Set up file watchers
-            foreach (var folder in foldersToWatch)
+            try
             {
-                if (!Directory.Exists(folder))
-                    Directory.CreateDirectory(folder);
+                // Initialize configuration
+                var configManager = new ConfigManager();
+                var config = configManager.LoadConfig();
 
-                new FileMonitor(folder, async filePath =>
-                {
-                    string filename = Path.GetFileName(filePath).ToLower();
-                    if (fileKeywords.Any(k => filename.Contains(k)))
-                    {
-                        var log = new
-                        {
-                            event_type = "file",
-                            filename,
-                            path = filePath,
-                            timestamp = DateTime.UtcNow,
-                            host = Environment.MachineName
-                        };
-                        string json = JsonSerializer.Serialize(log);
-                        await sender.SendAsync(json);
-                    }
-                });
+                // Initialize components
+                var logger = new Logger();
+                var offlineQueue = new OfflineQueue();
+                var jsonSender = new JsonSender(config.ServerAddress, offlineQueue, logger);
+                var ruleEngine = new RuleEngine(config, logger);
+
+                // Initialize monitors
+                fileMonitor = new FileMonitor(config, ruleEngine, jsonSender, logger);
+                processMonitor = new ProcessMonitor(config, ruleEngine, jsonSender, logger);
+
+                // Set up cancellation token for graceful shutdown
+                cancellationTokenSource = new CancellationTokenSource();
+                Console.CancelKeyPress += (sender, e) => {
+                    e.Cancel = true;
+                    cancellationTokenSource.Cancel();
+                    Console.WriteLine("\nShutdown requested. Stopping monitors...");
+                };
+
+                // Start monitoring
+                var fileMonitorTask = fileMonitor.StartMonitoring(cancellationTokenSource.Token);
+                var processMonitorTask = processMonitor.StartMonitoring(cancellationTokenSource.Token);
+                var queueProcessorTask = offlineQueue.StartProcessing(jsonSender, cancellationTokenSource.Token);
+
+                Console.WriteLine("Monitoring started. Press Ctrl+C to stop.");
+
+                // Wait for cancellation
+                await Task.WhenAny(
+                    Task.Delay(-1, cancellationTokenSource.Token),
+                    fileMonitorTask,
+                    processMonitorTask,
+                    queueProcessorTask
+                );
             }
-
-            // Start process monitoring loop
-            _ = Task.Run(async () =>
+            catch (Exception ex)
             {
-                while (true)
-                {
-                    var processes = ProcessMonitor.GetRunningProcessNames();
-                    foreach (var proc in processes)
-                    {
-                        if (processKeywords.Any(k => proc.Contains(k)))
-                        {
-                            var log = new
-                            {
-                                event_type = "process",
-                                name = proc,
-                                timestamp = DateTime.UtcNow,
-                                host = Environment.MachineName
-                            };
-                            string json = JsonSerializer.Serialize(log);
-                            await sender.SendAsync(json);
-                        }
-                    }
-                    await Task.Delay(3000);
-                }
-            });
-
-            Console.WriteLine("[*] Monitoring started. Press ENTER to exit.");
-            Console.ReadLine();
+                Console.WriteLine($"Fatal error: {ex.Message}");
+            }
+            finally
+            {
+                // Cleanup
+                fileMonitor?.Dispose();
+                processMonitor?.Dispose();
+                cancellationTokenSource?.Dispose();
+                Console.WriteLine("Monitoring agent stopped.");
+            }
         }
     }
 }
